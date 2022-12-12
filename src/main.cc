@@ -15,6 +15,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/ledc.h"
 
 #include "config.h"
 #include "ethernet.h"
@@ -39,6 +40,36 @@ static esp_err_t init_camera()
     }
 
     return ESP_OK;
+}
+
+static void ledc_init(void)
+{
+#define LEDC_TIMER LEDC_TIMER_1
+#define LEDC_MODE LEDC_LOW_SPEED_MODE
+#define LEDC_OUTPUT_IO (4) // Define the output GPIO
+#define LEDC_CHANNEL LEDC_CHANNEL_1
+#define LEDC_DUTY_RES LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
+#define LEDC_FREQUENCY (5000)           // Frequency in Hertz. Set frequency at 5 kHz
+    // Prepare and then apply the LEDC PWM timer configuration
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_MODE,
+        .duty_resolution = LEDC_DUTY_RES,
+        .timer_num = LEDC_TIMER,
+        .freq_hz = LEDC_FREQUENCY, // Set output frequency at 5 kHz
+        .clk_cfg = LEDC_AUTO_CLK};
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // Prepare and then apply the LEDC PWM channel configuration
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num = LEDC_OUTPUT_IO,
+        .speed_mode = LEDC_MODE,
+        .channel = LEDC_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER,
+        .duty = 0, // Set duty to 0%
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 }
 
 esp_err_t jpg_stream_httpd_handler(httpd_req_t *req)
@@ -127,6 +158,42 @@ static const httpd_uri_t stream = {
     .handler = jpg_stream_httpd_handler,
 };
 
+esp_err_t led_httpd_handler(httpd_req_t *req)
+{
+    char buf[100];
+    size_t buf_len;
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1)
+    {
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK)
+        {
+            ESP_LOGI(TAG, "Found URL query => %s", buf);
+            char param[32];
+            /* Get value of expected key from query string */
+            if (httpd_query_key_value(buf, "led", param, sizeof(param)) == ESP_OK)
+            {
+                ESP_LOGI(TAG, "Found URL query parameter => led=%s", param);
+                long led_value = strtol(param, NULL, 10);
+                uint32_t new_duty_cycle = led_value * 4096 / 100;
+                if (new_duty_cycle > 4096)
+                {
+                    new_duty_cycle = 4096;
+                }
+                ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, new_duty_cycle));
+                ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+                httpd_resp_send(req, "led brightness set", HTTPD_RESP_USE_STRLEN);
+            }
+        }
+    }
+    return ESP_OK;
+}
+
+static const httpd_uri_t led = {
+    .uri = "/led",
+    .method = HTTP_GET,
+    .handler = led_httpd_handler,
+};
+
 static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -139,6 +206,7 @@ static httpd_handle_t start_webserver(void)
         // Set URI handlers
         ESP_LOGI(TAG, "Registering URI handlers");
         httpd_register_uri_handler(server, &stream);
+        httpd_register_uri_handler(server, &led);
         return server;
     }
 
@@ -151,6 +219,8 @@ static void disconnect_handler(void *arg, esp_event_base_t event_base,
 {
     if (server)
     {
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 0));
+        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
         ESP_LOGI(TAG, "Stopping webserver");
         httpd_stop(server);
         server = nullptr;
@@ -162,6 +232,9 @@ static void connect_handler(void *arg, esp_event_base_t event_base,
 {
     if (server == nullptr)
     {
+        // turn on at minimal brightness
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, 1));
+        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
         ESP_LOGI(TAG, "Starting webserver");
         server = start_webserver();
     }
@@ -247,6 +320,8 @@ void cppmain()
 
     ESP_ERROR_CHECK(init_camera());
     init_ethernet();
+    // both timer and channel needs to be not 0 to not be in conflict with camera
+    ledc_init();
 
     while (1)
     {
