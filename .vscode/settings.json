@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "esp_camera.h": "c",
+        "cstdint": "cpp"
+    }
+}
